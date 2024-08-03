@@ -12,6 +12,8 @@ const ASTParser = @import("ast.zig").Parser;
 const Node = @import("ast.zig").Node;
 const Token = @import("lexer.zig").Token;
 const TokenType = @import("lexer.zig").TokenType;
+const ARMCompiler = @import("armv8_aarch64_backend/backend.zig").Compiler;
+const IRCompiler = @import("ir.zig").IRCompiler;
 
 fn displayHelp() !void {
     const help =
@@ -26,7 +28,7 @@ fn readFileAll(allocator: Allocator, path: [*:0]const u8) ![]u8 {
     try posix.lseek_END(fd, 0);
     const size = try posix.lseek_CUR_get(fd);
     try posix.lseek_SET(fd, 0);
-    var file = try allocator.alloc(u8, size);
+    var file = try allocator.alloc(u8, @intCast(size));
 
     var cur: usize = 0;
     while (cur != size)
@@ -36,15 +38,17 @@ fn readFileAll(allocator: Allocator, path: [*:0]const u8) ![]u8 {
 }
 
 fn build(allocator: Allocator, files_to_compile: [][*:0]const u8) !void {
-    var parser: ASTParser = undefined;
     for (files_to_compile) |file_name| {
         const buf = try readFileAll(allocator, file_name);
-        ASTParser.init(&parser, buf, allocator);
-        while (try parser.ok()) {
-            const node = try parser.parseStmt();
-            var printList = UsizeList.init(allocator);
-            defer printList.deinit();
-            try node.print(io.getStdOut().writer(), 0, &printList);
+        var parser = ASTParser.init(buf, allocator);
+        var irc = try IRCompiler.init(&parser);
+        defer irc.deinit();
+        var compiler = try ARMCompiler.init(io.getStdOut().writer(), allocator);
+        try compiler.startCompilation();
+        while (true) {
+            const text = try irc.next();
+            if (text.type == .EOF) break;
+            try compiler.compile(text, &parser);
         }
     }
     return;

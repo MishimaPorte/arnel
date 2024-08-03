@@ -1,10 +1,12 @@
 const ascii = @import("std").ascii;
 const FIFO = @import("std").fifo.LinearFifo;
 const mem = @import("std").mem;
+const math = @import("std").math;
 const log = @import("std").log;
 const Allocator = @import("std").mem.Allocator;
+const TokenList = @import("std").ArrayList(Token);
 
-pub const TokenType = enum {
+pub const TokenType = enum(u8) {
     // integers
     INT,
     FLOAT,
@@ -15,6 +17,7 @@ pub const TokenType = enum {
     EXPORT,
     RETURN,
     DO,
+    CONST,
     TRUE,
     FALSE,
     IDENT,
@@ -25,8 +28,10 @@ pub const TokenType = enum {
     MINUSEQ,
     PLUSPLUS,
     MINUSMINUS,
+    ARROW,
 
     // single-tokens
+    STRING,
     SEMICOLON,
     EQ,
     BRACKETL,
@@ -53,7 +58,6 @@ pub const TokenType = enum {
     TILDA,
     BACKTICK,
     COLON,
-    DCOLON,
     QUESTION,
     HAT,
     DOT,
@@ -90,22 +94,20 @@ pub const TokenType = enum {
 
 pub const ErrorLexing = error{
     ParseError,
+    BadTokenHandle,
 };
 
 pub const Token = struct {
-    type: TokenType,
-    text: []u8,
+    text: []const u8,
     line: usize,
     col: usize,
 
     pub fn new(
-        typ: TokenType,
-        text: []u8,
+        text: []const u8,
         line: usize,
         col: usize,
     ) Token {
         return .{
-            .type = typ,
             .text = text,
             .line = line,
             .col = col,
@@ -113,25 +115,47 @@ pub const Token = struct {
     }
 };
 
+pub const TokId = packed struct(usize) {
+    type: TokenType,
+    handle: u56,
+};
+
 pub const Lexer = struct {
-    buf: []u8,
+    buf: []const u8,
     cur: usize = 0,
     line: usize = 1,
     col: usize = 1,
-    fifo: FIFO(*Token, .Dynamic),
+    fifo: FIFO(TokId, .Dynamic),
     a: Allocator,
+    token_arena: TokenList,
+
+    pub fn init(allocator: Allocator, buf: []const u8) Lexer {
+        return .{
+            .buf = buf,
+            .fifo = FIFO(TokId, .Dynamic).init(allocator),
+            .a = allocator,
+            .token_arena = TokenList.init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Lexer) void {
+        self.token_arena.deinit();
+        self.fifo.deinit();
+    }
 
     inline fn char(self: *Lexer) u8 {
         return self.buf[self.cur];
     }
 
-    inline fn one(self: *Lexer) []u8 {
+    inline fn one(self: *Lexer) []const u8 {
         defer self.adv();
         return self.buf[self.cur .. self.cur + 1];
     }
 
     inline fn adv(self: *Lexer) void {
         self.cur = self.cur + 1;
+        if (self.cur == self.buf.len)
+            return;
         const c = self.char();
         if (c == '\n') {
             self.col = 0;
@@ -165,17 +189,15 @@ pub const Lexer = struct {
         return try self.tryParseWord(word, tt);
     }
 
-    fn parseIndet(self: *Lexer) !Token {
-        const col = self.col;
-        const line = self.line;
-        const start = self.cur;
-        const tt = try switch (self.char()) {
+    fn parseIndet(self: *Lexer) !TokenType {
+        return try switch (self.char()) {
             'd' => self.tryParse("o", .DO),
+            'c' => self.tryParse("onst", .CONST),
             'e' => self.tryParse("xport", .EXPORT),
             'i' => self.tryParse("mport", .IMPORT),
             't' => self.tryParse("rue", .TRUE),
             'f' => self.tryParse("alse", .FALSE),
-            'r' => self.tryParse("etrurn", .RETURN),
+            'r' => self.tryParse("eturn", .RETURN),
             else => b: {
                 var c = self.char();
                 while (ascii.isAlphanumeric(c) or c == '_') {
@@ -186,10 +208,10 @@ pub const Lexer = struct {
                 break :b .IDENT;
             },
         };
-        return Token.new(tt, self.buf[start..self.cur], line, col);
     }
 
     fn trimLeft(self: *Lexer) ?TokenType {
+        if (self.buf.len <= self.cur) return .EOF;
         while (ascii.isWhitespace(self.char())) {
             if (self.cur == self.buf.len - 1)
                 return .EOF;
@@ -198,97 +220,261 @@ pub const Lexer = struct {
         return null;
     }
 
-    fn ifTwoToken(self: *Lexer, comptime c: u8, comptime yes: TokenType, comptime no: TokenType, start_col: usize, start_line: usize) Token {
+    fn ifTwoToken(self: *Lexer, comptime c: u8, comptime yes: TokenType, comptime no: TokenType) TokenType {
         defer self.adv();
         if (self.buf.len - 1 >= self.cur + 1 and self.buf[self.cur + 1] == c) {
             self.adv();
-            return Token{
-                .type = yes,
-                .col = start_col,
-                .line = start_line,
-                .text = self.buf[self.cur - 1 .. self.cur + 1],
-            };
-        } else return Token{
-            .type = no,
-            .col = start_col,
-            .line = start_line,
-            .text = self.buf[self.cur .. self.cur + 1],
-        };
+            return yes;
+        } else return no;
     }
 
-    fn lexNext(self: *Lexer) !*Token {
-        const token = try self.a.create(Token);
+    fn allocToken(self: *Lexer) !u56 {
+        const tok_handle = self.token_arena.items.len;
+        if (tok_handle > math.maxInt(u56))
+            @panic("too many tokens!!!");
+        _ = try self.token_arena.addOne();
+        return @intCast(tok_handle);
+    }
+
+    pub fn getToken(self: *const Lexer, handle: u56) !*Token {
+        if (handle >= self.token_arena.items.len)
+            return ErrorLexing.BadTokenHandle;
+        return &self.token_arena.items[handle];
+    }
+
+    fn lexNext(self: *Lexer) !TokId {
         if (self.trimLeft()) |eof| {
-            token.* = Token.new(eof, self.buf[self.cur..], self.line, self.col);
-            return token;
+            const token_handle = try self.allocToken();
+            const token = try self.getToken(token_handle);
+            token.* = Token.new(self.buf[self.cur..], self.line, self.col);
+            return .{
+                .handle = token_handle,
+                .type = eof,
+            };
         }
+
+        const token_handle = try self.allocToken();
+        const token = try self.getToken(token_handle);
         const start = self.cur;
         const start_line = self.line;
         const start_col = self.col;
-
         const c = self.char();
-        token.* = switch (c) {
-            ';' => Token.new(.SEMICOLON, self.one(), start_line, start_col),
-            ':' => Token.new(.COLON, self.one(), start_line, start_col),
-
-            ')' => Token.new(.PARENR, self.one(), start_line, start_col),
-            '(' => Token.new(.PARENL, self.one(), start_line, start_col),
-            '}' => Token.new(.CURLYR, self.one(), start_line, start_col),
-            '{' => Token.new(.CURLYL, self.one(), start_line, start_col),
-            ']' => Token.new(.BRACKETR, self.one(), start_line, start_col),
-            '[' => Token.new(.BRACKETL, self.one(), start_line, start_col),
-
-            '+' => Token.new(.PLUS, self.one(), start_line, start_col),
-            '-' => Token.new(.MINUS, self.one(), start_line, start_col),
-            '=' => Token.new(.EQ, self.one(), start_line, start_col),
-            '*' => Token.new(.STAR, self.one(), start_line, start_col),
-            '`' => Token.new(.BACKTICK, self.one(), start_line, start_col),
-            '~' => Token.new(.TILDA, self.one(), start_line, start_col),
-            '\'' => Token.new(.COLON, self.one(), start_line, start_col),
-            '"' => Token.new(.DCOLON, self.one(), start_line, start_col),
-            '%' => Token.new(.PERCENT, self.one(), start_line, start_col),
-            '&' => Token.new(.REF, self.one(), start_line, start_col),
-            '?' => Token.new(.QUESTION, self.one(), start_line, start_col),
-            '$' => Token.new(.QUESTION, self.one(), start_line, start_col),
-            '#' => Token.new(.HASH, self.one(), start_line, start_col),
-            '@' => Token.new(.DOG, self.one(), start_line, start_col),
-            '^' => Token.new(.HAT, self.one(), start_line, start_col),
-            '/' => Token.new(.SLASH, self.one(), start_line, start_col),
-            '\\' => Token.new(.BACKSLASH, self.one(), start_line, start_col),
-            '.' => Token.new(.DOT, self.one(), start_line, start_col),
-            ',' => Token.new(.COMMA, self.one(), start_line, start_col),
-            '>' => self.ifTwoToken('=', .GTEQ, .GT, start_col, start_line),
-            '<' => self.ifTwoToken('=', .LTEQ, .LT, start_col, start_line),
-            '!' => self.ifTwoToken('=', .BANGEQ, .BANG, start_col, start_line),
-            else => b: {
+        switch (c) {
+            ';' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .SEMICOLON };
+            },
+            ':' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .COLON };
+            },
+            ')' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .PARENR };
+            },
+            '(' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .PARENL };
+            },
+            '}' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .CURLYR };
+            },
+            '{' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .CURLYL };
+            },
+            ']' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .BRACKETR };
+            },
+            '[' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .BRACKETL };
+            },
+            '+' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .PLUS };
+            },
+            '=' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .EQ };
+            },
+            '*' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .STAR };
+            },
+            '`' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .BACKTICK };
+            },
+            '~' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .TILDA };
+            },
+            '\'' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .COLON };
+            },
+            '%' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .PERCENT };
+            },
+            '&' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .REF };
+            },
+            '?' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .QUESTION };
+            },
+            '$' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .QUESTION };
+            },
+            '#' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .HASH };
+            },
+            '@' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .DOG };
+            },
+            '^' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .HAT };
+            },
+            '/' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .SLASH };
+            },
+            '\\' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .BACKSLASH };
+            },
+            '.' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .DOT };
+            },
+            ',' => {
+                token.* = Token.new(self.one(), start_line, start_col);
+                return .{ .handle = token_handle, .type = .COMMA };
+            },
+            '>' => {
+                const tt = self.ifTwoToken('=', .GTEQ, .GT);
+                token.* = if (tt == .GTEQ) Token{
+                    .col = start_col,
+                    .line = start_line,
+                    .text = self.buf[self.cur - 1 .. self.cur + 1],
+                } else Token{
+                    .col = start_col,
+                    .line = start_line,
+                    .text = self.buf[self.cur .. self.cur + 1],
+                };
+                return .{
+                    .handle = token_handle,
+                    .type = tt,
+                };
+            },
+            '-' => {
+                const tt = self.ifTwoToken('>', .ARROW, .MINUS);
+                token.* = if (tt == .LTEQ) Token{
+                    .col = start_col,
+                    .line = start_line,
+                    .text = self.buf[self.cur - 1 .. self.cur + 1],
+                } else Token{
+                    .col = start_col,
+                    .line = start_line,
+                    .text = self.buf[self.cur .. self.cur + 1],
+                };
+                return .{
+                    .handle = token_handle,
+                    .type = tt,
+                };
+            },
+            '<' => {
+                const tt = self.ifTwoToken('=', .LTEQ, .LT);
+                token.* = if (tt == .LTEQ) Token{
+                    .col = start_col,
+                    .line = start_line,
+                    .text = self.buf[self.cur - 1 .. self.cur + 1],
+                } else Token{
+                    .col = start_col,
+                    .line = start_line,
+                    .text = self.buf[self.cur .. self.cur + 1],
+                };
+                return .{
+                    .handle = token_handle,
+                    .type = tt,
+                };
+            },
+            '!' => {
+                const tt = self.ifTwoToken('=', .BANGEQ, .BANG);
+                token.* = if (tt == .BANGEQ) Token{
+                    .col = start_col,
+                    .line = start_line,
+                    .text = self.buf[self.cur - 1 .. self.cur + 1],
+                } else Token{
+                    .col = start_col,
+                    .line = start_line,
+                    .text = self.buf[self.cur .. self.cur + 1],
+                };
+                return .{
+                    .handle = token_handle,
+                    .type = tt,
+                };
+            },
+            '"' => {
+                self.adv();
+                while (self.char() != '"')
+                    self.adv();
+                self.adv();
+                token.* = Token.new(self.buf[start..self.cur], start_line, start_col);
+                return .{
+                    .handle = token_handle,
+                    .type = .STRING,
+                };
+            },
+            else => {
                 if (ascii.isDigit(c)) {
                     self.adv();
                     while (ascii.isDigit(self.char()))
                         self.adv();
 
-                    break :b .{
-                        .type = .INT,
+                    token.* = .{
                         .text = self.buf[start..self.cur],
                         .line = start_line,
                         .col = start_col,
                     };
-                } else if (ascii.isAlphabetic(c)) {
-                    break :b try self.parseIndet();
+                    return .{
+                        .handle = token_handle,
+                        .type = .INT,
+                    };
+                } else if (c == '_' or ascii.isAlphabetic(c)) {
+                    const tt = try self.parseIndet();
+                    token.* = .{
+                        .text = self.buf[start..self.cur],
+                        .line = start_line,
+                        .col = start_col,
+                    };
+                    return .{
+                        .handle = token_handle,
+                        .type = tt,
+                    };
                 } else {
                     return error.ParseError;
                 }
             },
-        };
-        return token;
+        }
     }
 
-    pub fn next(self: *Lexer) !*Token {
+    pub fn next(self: *Lexer) !TokId {
         if (self.fifo.readableLength() > 0) return self.fifo.readItem() orelse unreachable;
 
         return self.lexNext();
     }
 
-    pub fn peek(self: *Lexer, n: usize) !*Token {
+    pub fn peek(self: *Lexer, n: usize) !TokId {
         const qlen = self.fifo.readableLength();
         try self.fifo.ensureUnusedCapacity(n + 1);
         if (n >= qlen) {
@@ -301,3 +487,27 @@ pub const Lexer = struct {
         return self.fifo.peekItem(n);
     }
 };
+
+test "lexer operational" {
+    const testing = @import("std").testing;
+    var lexer = Lexer.init(testing.allocator,
+        \\const print = (a: int, b: int) -> {
+        \\
+        \\};
+    );
+    defer lexer.deinit();
+    const token_stream = [_]TokenType{
+        .CONST, .IDENT, .EQ,    .PARENL, .IDENT, .COLON,  .IDENT,  .COMMA,
+        .IDENT, .COLON, .IDENT, .PARENR, .ARROW, .CURLYL, .CURLYR, .SEMICOLON,
+        .EOF,
+    };
+    for (token_stream) |expected| {
+        const id = try lexer.next();
+        testing.expect(id.type == expected) catch |err| {
+            log.err("got token: {any}, expected: {any}\n", .{
+                id.type, expected,
+            });
+            return err;
+        };
+    }
+}
